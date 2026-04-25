@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-zip2md.py - v3 (Final)
-Best semantic, token-budgeted LLM context compiler for ZIP archives.
+zip2md.py - v4
+Advanced semantic, token-budgeted LLM context compiler with smart truncation and priority comments.
 """
 
 import zipfile
@@ -15,7 +15,6 @@ import math
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Set, List, Dict, Optional, Tuple, Any
-
 
 # ============================================================
 # CONFIGURATION
@@ -64,6 +63,13 @@ class Config:
         "4. Configuration & Metadata": "Environment configuration, system descriptors, and build metadata."
     })
 
+    section_order: List[str] = field(default_factory=lambda: [
+        "1. Entry Points",
+        "2. Core Logic & Implementation",
+        "3. Support & Utilities",
+        "4. Configuration & Metadata"
+    ])
+
 
 # ============================================================
 # TERMINAL + HELPERS
@@ -84,8 +90,79 @@ def init_terminal():
 init_terminal()
 
 def estimate_tokens(text: str) -> int:
-    """~4 characters per token approximation."""
-    return math.ceil(len(text) / 4.0)
+    """Improved estimation (~3.6 chars per token for code-heavy text)."""
+    return math.ceil(len(text) * 0.28)
+
+# Optional: much more accurate if tiktoken is installed
+try:
+    import tiktoken
+    enc = tiktoken.get_encoding("cl100k_base")
+    def estimate_tokens(text: str) -> int:
+        return len(enc.encode(text, disallowed_special=()))
+    print(f"{B}✓ Using tiktoken for precise token counting{R}")
+except ImportError:
+    pass
+
+
+def get_zip_hash(zip_path: str) -> str:
+    with open(zip_path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def smart_truncate(content: str, max_chars: int, path: str) -> Tuple[str, bool]:
+    """Keep beginning + end of file. Better for code (imports + main logic)."""
+    if len(content) <= max_chars:
+        return content, False
+
+    lines = content.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    if total_lines < 20:
+        return content[:max_chars] + "\n\n... [TRUNCATED] ...", True
+
+    keep_chars = max_chars - 120  # reserve space for marker
+    half = keep_chars // 2
+
+    head = ''.join(lines[:max(10, half // 80)])   # at least some lines
+    tail = ''.join(lines[-max(10, half // 80):])
+
+    # Fill remaining space proportionally
+    remaining = keep_chars - len(head) - len(tail)
+    if remaining > 100:
+        mid_start = len(head) // 80 + 5
+        mid = ''.join(lines[mid_start:mid_start + remaining // 80])
+    else:
+        mid = ""
+
+    marker = f"\n\n... [TRUNCATED: token budget reached — kept ~{len(head)+len(tail)+len(mid)} chars of {len(content)}] ...\n\n"
+
+    return head + marker + mid + tail, True
+
+
+def extract_priority(content: str, filename: str) -> Tuple[Optional[int], bool]:
+    """Look for # zip2md-priority: 300 or // zip2md-priority: 300 etc."""
+    ext = os.path.splitext(filename)[1].lower()
+    patterns = [
+        r'(?i)#\s*zip2md-priority:\s*(\d+)',
+        r'(?i)//\s*zip2md-priority:\s*(\d+)',
+        r'(?i)/\*\s*zip2md-priority:\s*(\d+)\s*\*/',
+        r'(?i)<!--\s*zip2md-priority:\s*(\d+)\s*-->',
+    ]
+
+    for pat in patterns:
+        match = re.search(pat, content)
+        if match:
+            try:
+                return int(match.group(1)), False
+            except ValueError:
+                pass
+
+    # Check for full include
+    full_pat = r'(?i)(zip2md-include:\s*full|zip2md-full)'
+    if re.search(full_pat, content):
+        return 1000, True  # very high priority + force full
+
+    return None, False
 
 
 # ============================================================
@@ -106,9 +183,11 @@ class FileAnalyzer:
         mime, _ = mimetypes.guess_type(filename)
         return mime and (mime.startswith('text/') or mime in {'application/json', 'application/javascript'})
 
-    def should_ignore(self, filepath: str, exclude_pattern: Optional[str] = None) -> bool:
+    def should_ignore(self, filepath: str, exclude_pattern: Optional[str] = None, ignore_rules: Set[str] = None) -> bool:
         parts = filepath.replace('\\', '/').split('/')
         if any(p.lower() in self.config.ignore_dirs for p in parts):
+            return True
+        if ignore_rules and any(re.search(rule, filepath, re.IGNORECASE) for rule in ignore_rules):
             return True
         if exclude_pattern:
             try:
@@ -129,7 +208,10 @@ class FileAnalyzer:
             return "3. Support & Utilities"
         return "2. Core Logic & Implementation"
 
-    def score_file(self, filepath: str, size: int) -> float:
+    def score_file(self, filepath: str, size: int, priority: Optional[int] = None) -> float:
+        if priority is not None:
+            return float(priority) + 1000.0  # manual priority dominates
+
         basename = os.path.basename(filepath).lower()
         filepath_lower = filepath.lower()
         parts = filepath_lower.replace('\\', '/').split('/')
@@ -147,22 +229,6 @@ class FileAnalyzer:
         score += 20 * math.log(max(size, 1))
         return max(score, 0.0)
 
-    def get_language(self, filename: str) -> str:
-        ext = os.path.splitext(filename)[1].lower()
-        ext_map = {
-            '.py':'python','.js':'javascript','.jsx':'jsx','.ts':'typescript','.tsx':'tsx',
-            '.html':'html','.css':'css','.scss':'scss','.json':'json','.md':'markdown',
-            '.java':'java','.c':'c','.cpp':'cpp','.h':'c','.hpp':'cpp','.cs':'csharp',
-            '.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.sh':'bash','.yaml':'yaml',
-            '.yml':'yaml','.kt':'kotlin','.swift':'swift','.lua':'lua','.tf':'terraform',
-            '.vue':'vue','.dart':'dart','.scala':'scala','.proto':'protobuf','.graphql':'graphql'
-        }
-        return ext_map.get(ext, '')
-
-    def get_safe_fence(self, content: str) -> str:
-        matches = re.findall(r"`{3,}", content)
-        return "`" * (max((len(m) for m in matches), default=3) + 1)
-
 
 # ============================================================
 # MARKDOWN EMITTER
@@ -175,23 +241,40 @@ class MarkdownEmitter:
 
     def emit_package_header(self, zip_name: str, file_hash: str, stats: Dict[str, Any]) -> str:
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return f"""# LLM Context Package | {zip_name}
+        return f"""# LLM Context Package | {zip_name} (v4)
 > **Generated:** {date_str} | **Source Hash:** {file_hash}
-> **Intent:** Token-budgeted, semantically ranked compilation optimized for LLM reasoning.
+> **Intent:** Token-budgeted, semantically ranked + priority-aware compilation for LLM reasoning.
 
 ## [0] System Overview & Metrics
 | Metric | Value |
 | :--- | :--- |
 | Files Processed | {stats['processed']} |
-| Total Size | {stats['size_mb']:.2f} MB |
+| Total Raw Size | {stats['size_mb']:.2f} MB |
 | Estimated Tokens | {stats['tokens_used']:,} / {stats['max_tokens']:,} ({stats['token_pct']:.1f}%) |
-| Filtered Items | {stats['ignored']} |
+| Filtered / Ignored | {stats['ignored']} |
+| Truncated Files | {stats.get('truncated_count', 0)} |
 
 ---
+
+## [TOC] Table of Contents
 """
 
+    def emit_toc(self, categories: Dict[str, List[Tuple]]) -> str:
+        toc = ["### Sections & Files\n"]
+        for cat_name in self.config.section_order:
+            entries = categories.get(cat_name, [])
+            if not entries:
+                continue
+            toc.append(f"**{cat_name}**")
+            for entry, _ in entries:
+                safe_path = entry.filename.replace(' ', '%20')
+                toc.append(f"- [{entry.filename}](#file-{safe_path.replace('/', '-').replace('.', '-')})")
+            toc.append("")
+        toc.append("---\n")
+        return "\n".join(toc)
+
     def emit_tree(self, file_paths: List[str]) -> str:
-        tree = ["## [1] Repository Structure\n\n```text"]
+        tree = ["## [1] Included Repository Structure\n\n```text"]
         nodes: Dict[str, Any] = {}
         for path in file_paths:
             parts = path.split('/')
@@ -201,11 +284,13 @@ class MarkdownEmitter:
 
         def render(node: Dict, indent: str = "") -> List[str]:
             lines = []
-            for i, key in enumerate(sorted(node.keys())):
-                is_last = i == len(node) - 1
+            keys = sorted(node.keys())
+            for i, key in enumerate(keys):
+                is_last = i == len(keys) - 1
                 prefix = "└── " if is_last else "├── "
                 lines.append(f"{indent}{prefix}{key}")
-                lines.extend(render(node[key], indent + ("    " if is_last else "│   ")))
+                if node[key]:
+                    lines.extend(render(node[key], indent + ("    " if is_last else "│   ")))
             return lines
 
         tree.extend(render(nodes))
@@ -216,11 +301,13 @@ class MarkdownEmitter:
         summary = self.config.section_summaries.get(category, "")
         return f"## {category}\n\n> {summary}\n\n" if summary else f"## {category}\n\n"
 
-    def emit_file_block(self, path: str, content: str, size: int) -> str:
+    def emit_file_block(self, path: str, content: str, size: int, was_truncated: bool) -> str:
         size_kb = size / 1024
-        fence = self.analyzer.get_safe_fence(content)
-        lang = self.analyzer.get_language(path)
-        return f"### File: `{path}` ({size_kb:.1f} KB)\n{fence}{lang}\n{content}\n{fence}\n\n"
+        fence = self.analyzer.get_safe_fence(content) if hasattr(self.analyzer, 'get_safe_fence') else "```"
+        lang = self.analyzer.get_language(path) if hasattr(self.analyzer, 'get_language') else ""
+        anchor = f"id=\"file-{path.replace('/', '-').replace('.', '-')}\""
+        truncated_note = " *(truncated)*" if was_truncated else ""
+        return f"### File: `{path}` ({size_kb:.1f} KB){truncated_note} <a {anchor}></a>\n{fence}{lang}\n{content}\n{fence}\n\n"
 
 
 # ============================================================
@@ -231,22 +318,35 @@ def zip_to_md(zip_path: str, output_md_path: str, config: Config, exclude_patter
     analyzer = FileAnalyzer(config)
     emitter = MarkdownEmitter(analyzer, config)
 
-    print(f"{B}{BOLD}📦 Compiling Context Package v3...{R}")
+    print(f"{B}{BOLD}📦 Compiling Context Package v4...{R}")
 
     if not zipfile.is_zipfile(zip_path):
         print(f"{Y}❌ Invalid zip file{R}", file=sys.stderr)
         sys.exit(1)
 
     try:
+        file_hash = get_zip_hash(zip_path)
+
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            # Phase 1: Metadata only
+            # Load optional .zip2mdignore
+            ignore_rules: Set[str] = set()
+            try:
+                ignore_info = zf.getinfo('.zip2mdignore')
+                with zf.open(ignore_info) as f:
+                    ignore_rules = {line.strip() for line in f.read().decode('utf-8', errors='replace').splitlines()
+                                    if line.strip() and not line.startswith('#')}
+            except KeyError:
+                pass
+
+            # Phase 1: Collect eligible files
             eligible = []
             total_raw_size = 0
             ignored_count = 0
 
             for entry in zf.infolist():
-                if entry.is_dir(): continue
-                if analyzer.should_ignore(entry.filename, exclude_pattern):
+                if entry.is_dir(): 
+                    continue
+                if analyzer.should_ignore(entry.filename, exclude_pattern, ignore_rules):
                     ignored_count += 1
                     continue
                 if not analyzer.is_text_file(entry.filename):
@@ -262,43 +362,52 @@ def zip_to_md(zip_path: str, output_md_path: str, config: Config, exclude_patter
                 print(f"{Y}⚠️ No eligible text files found{R}")
                 return
 
-            # Phase 2: Score and sort by importance
-            scored_eligible = [(analyzer.score_file(e.filename, e.file_size), e) for e in eligible]
+            # Phase 2: Score with priority parsing
+            scored_eligible = []
+            for entry in eligible:
+                with zf.open(entry) as f:
+                    content = f.read().decode('utf-8', errors='replace')
+                priority, force_full = extract_priority(content, entry.filename)
+                score = analyzer.score_file(entry.filename, entry.file_size, priority)
+                scored_eligible.append((score, entry, content, priority, force_full))
+
             scored_eligible.sort(key=lambda x: x[0], reverse=True)
 
             # Phase 3: Token-budgeted selection + smart truncation
             effective_budget = config.max_tokens - config.reserve_tokens
             selected = []
             used_tokens = 0
-            truncated = False
+            truncated_count = 0
+            forced_full = []
 
-            for _, entry in scored_eligible:
-                with zf.open(entry) as f:
-                    content = f.read().decode('utf-8', errors='replace')
+            for _, entry, content, priority, force_full in scored_eligible:
+                if force_full and used_tokens + estimate_tokens(content) < config.max_tokens * 0.95:
+                    selected.append((entry, content, False))
+                    used_tokens += estimate_tokens(content)
+                    forced_full.append(entry.filename)
+                    continue
 
                 tokens_needed = estimate_tokens(content)
 
                 if used_tokens + tokens_needed <= effective_budget:
-                    selected.append((entry, content))
+                    selected.append((entry, content, False))
                     used_tokens += tokens_needed
                 else:
                     remaining = effective_budget - used_tokens
-                    if remaining > 200:
-                        trunc_len = int(remaining * 4)
-                        content = content[:trunc_len] + "\n\n... [TRUNCATED: token budget reached] ..."
-                        selected.append((entry, content))
-                        used_tokens += estimate_tokens(content)
-                        truncated = True
+                    if remaining > 500:  # reasonable minimum
+                        trunc_chars = int(remaining * 3.6)
+                        truncated_content, was_truncated = smart_truncate(content, trunc_chars, entry.filename)
+                        selected.append((entry, truncated_content, was_truncated))
+                        used_tokens += estimate_tokens(truncated_content)
+                        if was_truncated:
+                            truncated_count += 1
                     break
 
-            # Phase 4: Group into semantic categories
-            categories: Dict[str, List[Tuple]] = {
-                "1. Entry Points": [], "2. Core Logic & Implementation": [],
-                "3. Support & Utilities": [], "4. Configuration & Metadata": []
-            }
-            for entry, content in selected:
+            # Phase 4: Group by category (preserve section order)
+            categories: Dict[str, List[Tuple]] = {cat: [] for cat in config.section_order}
+            for entry, content, was_truncated in selected:
                 cat = analyzer.get_category(entry.filename)
-                categories[cat].append((entry, content))
+                categories[cat].append((entry, content, was_truncated))
 
             # Stats
             stats: Dict[str, Any] = {
@@ -307,28 +416,31 @@ def zip_to_md(zip_path: str, output_md_path: str, config: Config, exclude_patter
                 'size_mb': total_raw_size / (1024 * 1024),
                 'tokens_used': used_tokens + config.reserve_tokens,
                 'max_tokens': config.max_tokens,
-                'token_pct': ((used_tokens + config.reserve_tokens) / config.max_tokens) * 100
+                'token_pct': ((used_tokens + config.reserve_tokens) / config.max_tokens) * 100,
+                'truncated_count': truncated_count
             }
-
-            with open(zip_path, 'rb') as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()[:12]
 
         # Phase 5: Write output
         with open(output_md_path, 'w', encoding='utf-8') as md:
             md.write(emitter.emit_package_header(os.path.basename(zip_path), file_hash, stats))
-            md.write(emitter.emit_tree([e.filename for e, _ in selected]))  # Only included files
+            md.write(emitter.emit_toc(categories))
+            md.write(emitter.emit_tree([e.filename for e, _, _ in selected]))
 
-            for cat_name, entries in categories.items():
-                if not entries: continue
+            for cat_name in config.section_order:
+                entries = categories.get(cat_name, [])
+                if not entries:
+                    continue
                 md.write(emitter.emit_section_header(cat_name))
-                for entry, content in entries:
-                    md.write(emitter.emit_file_block(entry.filename, content, entry.file_size))
+                for entry, content, was_truncated in entries:
+                    md.write(emitter.emit_file_block(entry.filename, content, entry.file_size, was_truncated))
                 md.write("\n---\n")
 
         print(f"\n{G}{BOLD}✨ Done: {output_md_path}{R}")
         print(f"   → {stats['processed']} files | ~{stats['tokens_used']:,} tokens")
-        if truncated:
-            print(f"   → Last file was smart-truncated to fit budget")
+        if truncated_count:
+            print(f"   → {truncated_count} file(s) smart-truncated")
+        if forced_full:
+            print(f"   → {len(forced_full)} file(s) forced full via priority comment")
 
     except Exception as e:
         print(f"\n{Y}❌ Error: {e}{R}", file=sys.stderr)
@@ -340,7 +452,7 @@ def zip_to_md(zip_path: str, output_md_path: str, config: Config, exclude_patter
 # ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="zip2md v3 — Semantic token-budgeted LLM context compiler")
+    parser = argparse.ArgumentParser(description="zip2md v4 — Advanced semantic LLM context compiler")
     parser.add_argument("zip_file")
     parser.add_argument("output", nargs="?")
     parser.add_argument("--exclude", help="Regex to exclude files")
@@ -354,6 +466,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     config = Config(max_tokens=args.max_tokens, reserve_tokens=args.reserve_tokens)
-    out_path = args.output or f"{os.path.splitext(os.path.basename(args.zip_file))[0]}.md"
+    out_path = args.output or f"{os.path.splitext(os.path.basename(args.zip_file))[0]}_v4.md"
 
     zip_to_md(args.zip_file, out_path, config, args.exclude)
