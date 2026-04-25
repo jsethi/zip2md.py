@@ -1,194 +1,130 @@
 # zip2md.py
 
-A lightweight, dependency-free tool that converts ZIP archives of
-codebases into structured, LLM-optimized Markdown "context packages".
+**v4.1** — Advanced semantic token-budgeted LLM context compiler for ZIP archives.
 
-It is designed for deterministic, high-signal ingestion into LLMs (GPT,
-Claude, local models), preserving full source fidelity while organizing
-content by architectural role.
+A lightweight, dependency-free tool that converts codebases (packaged as ZIP) into clean, structured, high-signal Markdown files optimized for LLMs like Claude, Grok, GPT, and Gemini.
 
 ------------------------------------------------------------------------
 
 ## What it does
 
-`zip2md.py` transforms a ZIP archive into a single Markdown document
-containing:
+`zip2md.py` takes a ZIP archive and produces a single Markdown document that is:
 
--   Semantic code organization (entry points, core logic, utilities,
-    configuration)
--   Repository structure tree for navigation
--   Full file contents with syntax highlighting
--   Noise filtering (e.g. node_modules, .git, build artifacts)
--   Deterministic output (stable ordering for reproducibility)
--   Source metadata (file count, size, SHA256 hash)
+- Semantically organized by architectural importance
+- Token-budget aware with smart truncation
+- Enriched with priority comments and a navigable Table of Contents
+- Filtered from common noise (build dirs, caches, etc.)
+- Reproducible via source hash and stable ordering
 
-The output is optimized for LLM context ingestion rather than human
-browsing.
+Perfect for feeding large projects into LLMs without wasting context tokens.
 
 ------------------------------------------------------------------------
 
-## Why this exists
+## Key Features (v4.1)
 
-LLMs perform better when context is:
-
--   Structured (not flat file dumps)
--   Filtered (no irrelevant noise)
--   Semantically grouped (not alphabetically ordered)
--   Deterministic (reproducible across runs)
-
-This tool bridges raw code archives → LLM-ready context in a single
-step.
-
-------------------------------------------------------------------------
-
-## Features
-
--   Single-file Markdown output (portable context artifact)
--   Semantic grouping of files by architectural role
--   Multi-language syntax highlighting (30+ languages)
--   Built-in ignore rules for common noise directories
--   Optional regex-based exclusion
--   Safe handling of encoding and large files
--   Repository tree visualization
--   SHA256 source fingerprinting
--   Zero external dependencies (stdlib only)
+- **Smart Truncation**: Keeps the beginning (imports/structure) + end (main logic) of files when hitting token limits
+- **Priority Comments**: Control inclusion order and force full files with:
+  - `# zip2md-priority: 450`
+  - `// zip2md-include: full`
+- **Improved Table of Contents** with direct links to every file
+- Semantic grouping: Entry Points → Core Logic → Utilities → Configuration
+- Repository tree visualization
+- `.zip2mdignore` support (like .gitignore)
+- Safe code fences and multi-language syntax highlighting
+- Detailed statistics and SHA256 source hash
+- Zero external dependencies (optional `tiktoken` for better token counting)
 
 ------------------------------------------------------------------------
 
 ## Installation
 
-``` bash
+```bash
 git clone https://github.com/jsethi/zip2md.py.git
 cd zip2md.py
 ```
 
-No external dependencies required.
+No dependencies required (Python 3.8+).
 
 ------------------------------------------------------------------------
 
 ## Usage
 
-### Basic usage
+### Basic
 
-``` bash
+```bash
 python zip2md.py myproject.zip
 ```
 
-Output:
+Creates: `myproject_v4.md`
 
-``` text
-myproject.md
+### Custom output
+
+```bash
+python zip2md.py myproject.zip mycontext.md
+```
+
+### Advanced options
+
+```bash
+python zip2md.py project.zip --max-tokens 200000 --exclude "test_|\\.min\\."
 ```
 
 ------------------------------------------------------------------------
 
-### Custom output file
+## Priority Comments (New in v4)
 
-``` bash
-python zip2md.py myproject.zip output.md
+Add near the top of important files:
+
+```python
+# zip2md-priority: 500        # Higher number = stronger priority
+```
+
+```typescript
+// zip2md-include: full        # Try to keep this file completely
 ```
 
 ------------------------------------------------------------------------
 
-### Exclude files by pattern
+## Output Structure
 
-``` bash
-python zip2md.py myproject.zip output.md --exclude "test_|__pycache__|\\.min\\.js"
+1. **System Overview & Metrics** – token usage, file count, hash
+2. **Table of Contents** – clickable links
+3. **Repository Structure** – tree view of included files
+4. Categorized sections with helpful summaries
+5. Individual file blocks with syntax highlighting and truncation indicators
+
+------------------------------------------------------------------------
+
+## Example Workflow
+
+```bash
+# Package your project
+zip -r project.zip ./src ./app config/ package.json
+
+# Generate LLM-ready context
+python zip2md.py project.zip
+
+# Paste the resulting .md into your LLM
 ```
 
 ------------------------------------------------------------------------
 
-## Output structure
+## Design Principles
 
-### Metadata header
-
--   Timestamp
--   Source hash (SHA256)
--   File statistics
-
-### Repository tree
-
-``` text
-src/
-├── main.py
-├── app.py
-config/
-└── settings.json
-```
-
-### Categorized file sections
-
-#### Entry Points
-
-Core application entry files
-
-#### Core Logic & Implementation
-
-Primary business logic and system functionality
-
-#### Support & Utilities
-
-Helpers, tests, utilities, and scaffolding code
-
-#### Configuration & Metadata
-
-Config files and environment definitions
-
-### File blocks
-
-``` python
-### File: src/main.py (5.2 KB)
-
-def main():
-    print("hello world")
-```
-
-------------------------------------------------------------------------
-
-## Configuration
-
-  Setting            Purpose
-  ------------------ --------------------------------------
-  ignore_dirs        Directories excluded from processing
-  code_extensions    Recognized source code file types
-  config_exts        Configuration / metadata file types
-  entry_points       System entry files
-  utility_keywords   Utility classification heuristics
-  max_file_size      Maximum file size (default 10MB)
-
-------------------------------------------------------------------------
-
-## Design principles
-
--   Deterministic output
--   No external dependencies
--   Full fidelity preservation
--   LLM-first structure
--   Semantic organization
+- Maximum reasoning value per token
+- Semantic importance over file name order
+- Graceful degradation when hitting context limits
+- Reproducible and deterministic output
+- LLM-first, human-readable when needed
 
 ------------------------------------------------------------------------
 
 ## Limitations
 
--   Does not analyze or execute code
--   Binary files are ignored
--   Large repos may generate large outputs
--   Optimized for LLM consumption, not human reading
-
-------------------------------------------------------------------------
-
-## Example workflow
-
-``` bash
-zip -r project.zip ./src ./config package.json README.md
-python zip2md.py project.zip
-```
-
-Feed output into:
-
--   LLM APIs (GPT, Claude)
--   RAG pipelines
--   Local models
+- Binary files are ignored
+- Does not execute or analyze code logic
+- Very large repositories may still require manual token tuning
+- Optimized primarily for LLM ingestion
 
 ------------------------------------------------------------------------
 
@@ -200,7 +136,12 @@ MIT
 
 ## Contributing
 
--   Add language support
--   Improve categorization
--   Optimize performance
--   Extend output formats
+Welcome! Possible improvements:
+- Directory input support (no zip needed)
+- Auto-generated file summaries
+- More intelligent truncation strategies
+- Additional output formats
+
+---
+
+**Created to make feeding real codebases into LLMs fast and effective.**
