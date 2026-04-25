@@ -1,6 +1,6 @@
 # zip2md.py
 
-**v4.1** — Advanced semantic token-budgeted LLM context compiler for ZIP archives.
+**v4.1**  Advanced semantic token-budgeted LLM context compiler for ZIP archives.
 
 A lightweight, dependency-free tool that converts codebases (packaged as ZIP) into clean, structured, high-signal Markdown files optimized for LLMs like Claude, Grok, GPT, and Gemini.
 
